@@ -11,3 +11,12 @@
 /pom.xml
 /tests
 *.log
+# IDE / editor artifacts (2026-10-11)
+/.idea/
+*.iml
+/.vscode/
+/.metals/
+/nohup.out
+
+# local build output
+/build/
