@@ -1,0 +1,119 @@
+name: SysY → LLVM IR build
+
+# 课程实验仓库的 Linux 端验证：语法 → 语义 → LLVM IR 生成 → clang 链接运行。
+# 本地 Windows 只能验到 ANTLR 段（拿不到 llvm 原生库），这条 workflow 补上后端这一段。
+on:
+  push:
+    branches: [lab8]
+  pull_request:
+    branches: [lab8]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ANTLR_VERSION: "4.9.1"
+  BYTEDECO: "1.5.7"
+  LLVM_PRESET: "13.0.1-1.5.7"
+  JARS: ${{ github.workspace }}/jars
+
+jobs:
+  build:
+    name: compile and regenerate IR (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # README 要求 JDK 11；本地已用 JDK 11/17 分别验证过可通过
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Restore jar cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.JARS }}
+          key: jars-antlr${{ env.ANTLR_VERSION }}-llvm${{ env.LLVM_PRESET }}
+
+      - name: Download ANTLR and JavaCPP/LLVM jars
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$JARS"
+          BASE=https://repo1.maven.org/maven2
+          curl -sSfL --retry 3 -o "$JARS/antlr-$ANTLR_VERSION-complete.jar" \
+            "https://www.antlr.org/download/antlr-$ANTLR_VERSION-complete.jar"
+          for a in \
+            "$BASE/org/bytedeco/javacpp/$BYTEDECO/javacpp-$BYTEDECO.jar" \
+            "$BASE/org/bytedeco/javacpp/$BYTEDECO/javacpp-$BYTEDECO-linux-x86_64.jar" \
+            "$BASE/org/bytedeco/llvm/$LLVM_PRESET/llvm-$LLVM_PRESET.jar" \
+            "$BASE/org/bytedeco/llvm/$LLVM_PRESET/llvm-$LLVM_PRESET-linux-x86_64.jar" ; do
+            echo "-> $(basename "$a")"
+            curl -sSfL --retry 3 -o "$JARS/$(basename "$a")" "$a"
+          done
+          ls -la "$JARS"
+
+      - name: Check grammars compile (regen into scratch dir)
+        run: |
+          set -euo pipefail
+          mkdir -p regen && cp src/SysYLexer.g4 src/SysYParser.g4 regen/
+          cd regen
+          java -jar "$JARS/antlr-$ANTLR_VERSION-complete.jar" \
+            -listener -visitor -long-messages SysYParser.g4 SysYLexer.g4
+          test -f SysYLexer.java && test -f SysYParser.java && test -f SysYParserVisitor.java
+          echo "grammars OK: $(ls *.java | tr '\n' ' ')"
+
+      - name: Compile Java sources
+        run: |
+          set -euo pipefail
+          # src/gen 是残留的旧生成物，与 src/ 下同名类冲突（javac 会报「类重复」），必须排除
+          find src -name "*.java" -not -path "src/gen/*" -not -path "regen/*" > sources.txt
+          echo "compiling $(wc -l < sources.txt) files"
+          mkdir -p classes
+          javac -nowarn -encoding UTF-8 \
+            -cp "$JARS/antlr-$ANTLR_VERSION-complete.jar:$JARS/javacpp-$BYTEDECO.jar:$JARS/llvm-$LLVM_PRESET.jar" \
+            @sources.txt -d classes
+          test -f classes/Main.class
+
+      - name: Generate LLVM IR and compare with committed reference
+        run: |
+          set -euo pipefail
+          for t in lab8-test1 lab8-test2; do
+            echo "=== $t ==="
+            java -cp "classes:$JARS/*" Main "tests/$t.sysy" "$t.ll"
+            test -s "$t.ll"
+            # checkout 出来的是 LF，若本地开发机是 CRLF 也一并容忍
+            if diff --strip-trailing-cr "$t.ll" "tests/$t.out"; then
+              echo "IR matches tests/$t.out"
+            else
+              echo "::error::$t IR differs from tests/$t.out"
+              exit 1
+            fi
+          done
+
+      - name: Link with clang and run
+        run: |
+          set -euo pipefail
+          clang --version | head -2
+          for t in lab8-test1 lab8-test2; do
+            clang -w -O0 "$t.ll" -o "$t.bin"
+            ./"$t.bin"
+            echo "$t ran, exit code=$?"
+          done
+
+      - name: Upload generated IR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-ir
+          path: |
+            lab8-test1.ll
+            lab8-test2.ll
+          if-no-files-found: ignore
