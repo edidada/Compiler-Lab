@@ -110,12 +110,8 @@ jobs:
             clang -w -O0 "$t.ll" -o "$t.bin"
             rc=0; stdout=$(./"$t.bin") || rc=$?
             echo "$t: exit=$rc expect=${EXPECT[$t]} stdout_bytes=${#stdout}"
-            if [ "$rc" -ge 128 ]; then
-              echo "::error::$t crashed (exit $rc = signal)"
-              exit 1
-            fi
             if [ "$rc" -ne "${EXPECT[$t]}" ]; then
-              echo "::error::$t returned $rc, expected ${EXPECT[$t]}"
+              echo "::error::$t returned $rc, expected ${EXPECT[$t]}（不等也可能是被信号杀死：134=SIGABRT 139=SIGSEGV）"
               exit 1
             fi
           done
@@ -125,17 +121,17 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          printf '%-16s %-10s %s\n' TEST IR RUN
+          # 退出码是 main 返回值的低 8 位（如 INT_MAX -> 255），所以只列数字不做判定
+          printf '%-16s %-8s %s\n' TEST IR EXIT
           for f in tests/lab4-test*.sysy tests/lab5-test*.sysy \
                    tests/lab6-test*.sysy tests/lab7-test*.sysy; do
             t=$(basename "$f" .sysy)
             if java -cp "classes:$JARS/*" Main "$f" "smoke-$t.ll" 2>/dev/null \
                && clang -w -O0 "smoke-$t.ll" -o "smoke-$t.bin" 2>/dev/null; then
               rc=0; ./smoke-"$t".bin >/dev/null 2>&1 || rc=$?
-              if [ "$rc" -ge 128 ]; then printf '%-16s %-10s %s\n' "$t" ok "CRASH($rc)"
-              else printf '%-16s %-10s %s\n' "$t" ok "exit=$rc"; fi
+              printf '%-16s %-8s %s\n' "$t" ok "$rc"
             else
-              printf '%-16s %-10s %s\n' "$t" FAIL '-'
+              printf '%-16s %-8s %s\n' "$t" FAIL '-'
             fi
           done
 
