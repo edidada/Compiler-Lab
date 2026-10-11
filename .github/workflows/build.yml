@@ -98,14 +98,45 @@ jobs:
             fi
           done
 
-      - name: Link with clang and run
+      - name: Link with clang and check program exit codes
         run: |
           set -euo pipefail
           clang --version | head -2
+          # main 的返回值就是测试结果：
+          #   lab8-test1 -> f(local_arr) 走 else 分支 = 2
+          #   lab8-test2 -> {1,5} 与 {1,4,14} 归并后 {1,1,4,5,14} 的末元素 = 14
+          declare -A EXPECT=([lab8-test1]=2 [lab8-test2]=14)
           for t in lab8-test1 lab8-test2; do
             clang -w -O0 "$t.ll" -o "$t.bin"
-            ./"$t.bin"
-            echo "$t ran, exit code=$?"
+            rc=0; stdout=$(./"$t.bin") || rc=$?
+            echo "$t: exit=$rc expect=${EXPECT[$t]} stdout_bytes=${#stdout}"
+            if [ "$rc" -ge 128 ]; then
+              echo "::error::$t crashed (exit $rc = signal)"
+              exit 1
+            fi
+            if [ "$rc" -ne "${EXPECT[$t]}" ]; then
+              echo "::error::$t returned $rc, expected ${EXPECT[$t]}"
+              exit 1
+            fi
+          done
+
+      # 早期实验的用例只做「能编译、不崩」的冒烟检查，没有权威期望值所以不卡门禁
+      - name: Smoke run lab4~lab7 tests (informational)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          printf '%-16s %-10s %s\n' TEST IR RUN
+          for f in tests/lab4-test*.sysy tests/lab5-test*.sysy \
+                   tests/lab6-test*.sysy tests/lab7-test*.sysy; do
+            t=$(basename "$f" .sysy)
+            if java -cp "classes:$JARS/*" Main "$f" "smoke-$t.ll" 2>/dev/null \
+               && clang -w -O0 "smoke-$t.ll" -o "smoke-$t.bin" 2>/dev/null; then
+              rc=0; ./smoke-"$t".bin >/dev/null 2>&1 || rc=$?
+              if [ "$rc" -ge 128 ]; then printf '%-16s %-10s %s\n' "$t" ok "CRASH($rc)"
+              else printf '%-16s %-10s %s\n' "$t" ok "exit=$rc"; fi
+            else
+              printf '%-16s %-10s %s\n' "$t" FAIL '-'
+            fi
           done
 
       - name: Upload generated IR
