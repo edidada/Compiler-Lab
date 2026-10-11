@@ -1,0 +1,135 @@
+name: SysY compiler build
+
+# 一份 workflow 适配 lab0~lab8 全部分支：按当前分支实际存在的文件决定验证路径。
+#   lab0            只有 Main（读文件）              -> 编译 + 运行 rc=0
+#   lab1~lab3       ANTLR 词法/语法/语义              -> 生成 + 编译 + 跑 tests/*.sysy
+#   lab4~lab7       LLVM IR                          -> 出 IR + clang 链接 + 断言退出码
+#   lab8            LLVM IR + tests/lab8-*.out 参考    -> 再加 IR 逐字节比对
+on:
+  push:
+    branches: [lab0, lab1, lab2, lab3, lab4, lab5, lab6, lab7, lab8]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ANTLR_VERSION: "4.9.1"
+  BYTEDECO: "1.5.7"
+  LLVM_PRESET: "13.0.1-1.5.7"
+  JARS: ${{ github.workspace }}/jars
+
+jobs:
+  build:
+    name: ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Restore jar cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.JARS }}
+          key: jars-antlr${{ env.ANTLR_VERSION }}-llvm${{ env.LLVM_PRESET }}
+
+      - name: Download ANTLR and JavaCPP/LLVM jars
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$JARS"
+          BASE=https://repo1.maven.org/maven2
+          curl -sSfL --retry 3 -o "$JARS/antlr-$ANTLR_VERSION-complete.jar" \
+            "https://www.antlr.org/download/antlr-$ANTLR_VERSION-complete.jar"
+          for a in \
+            "$BASE/org/bytedeco/javacpp/$BYTEDECO/javacpp-$BYTEDECO.jar" \
+            "$BASE/org/bytedeco/javacpp/$BYTEDECO/javacpp-$BYTEDECO-linux-x86_64.jar" \
+            "$BASE/org/bytedeco/llvm/$LLVM_PRESET/llvm-$LLVM_PRESET.jar" \
+            "$BASE/org/bytedeco/llvm/$LLVM_PRESET/llvm-$LLVM_PRESET-linux-x86_64.jar" ; do
+            curl -sSfL --retry 3 -o "$JARS/$(basename "$a")" "$a"
+          done
+          ls -la "$JARS"
+
+      # lab1 起才有 .g4；生成物直接写进 src/（与各分支 Makefile 的 antlr 目标一致）
+      - name: Generate lexer/parser from grammar (if any)
+        run: |
+          set -euo pipefail
+          if ls src/*.g4 >/dev/null 2>&1; then
+            (cd src && java -jar "$JARS/antlr-$ANTLR_VERSION-complete.jar" \
+              -listener -visitor -long-messages *.g4)
+            echo "generated: $(ls src/*.java | wc -l) java files in src/"
+          else
+            echo "no .g4 on ${{ github.ref_name }}, skipping"
+          fi
+
+      - name: Compile Java sources
+        run: |
+          set -euo pipefail
+          # src/gen 是残留的旧生成物，与 src/ 下同名类冲突（javac 报「类重复」）
+          find src -name "*.java" -not -path "src/gen/*" > sources.txt
+          echo "compiling $(wc -l < sources.txt) files"
+          mkdir -p classes
+          javac -nowarn -encoding UTF-8 \
+            -cp "$JARS/antlr-$ANTLR_VERSION-complete.jar:$JARS/javacpp-$BYTEDECO.jar:$JARS/llvm-$LLVM_PRESET.jar" \
+            @sources.txt -d classes
+          test -f classes/Main.class
+
+      # lab4 起 Main(src, dest) 出 IR；退出码即 main 返回值（低 8 位）
+      - name: Generate LLVM IR, link and run with expected exit codes
+        if: contains(fromJSON('["lab4","lab5","lab6","lab7","lab8"]'), github.ref_name)
+        run: |
+          set -euo pipefail
+          declare -A EXPECT=([lab8-test1]=2 [lab8-test2]=14 \
+                             [llvm-ir-test1]=255 [llvm-ir-test2]=13)
+          if [ "${{ github.ref_name }}" = "lab8" ]; then
+            CASES="lab8-test1 lab8-test2"; DIFF_REF=1
+          else
+            CASES="llvm-ir-test1 llvm-ir-test2"; DIFF_REF=0
+          fi
+          for c in $CASES; do
+            [ -f "tests/$c.sysy" ] || { echo "::warning::tests/$c.sysy missing"; continue; }
+            java -cp "classes:$JARS/*" Main "tests/$c.sysy" "$c.ll"
+            test -s "$c.ll"
+            printf '%s: IR=%s lines' "$c" "$(wc -l < "$c.ll")"
+            if [ "$DIFF_REF" = 1 ] && [ -f "tests/$c.out" ]; then
+              if diff --strip-trailing-cr "$c.ll" "tests/$c.out"; then echo -n " REF=MATCH"
+              else echo "::error::$c IR differs from tests/$c.out"; exit 1; fi
+            fi
+            clang -w -O0 "$c.ll" -o "$c.bin"
+            rc=0; ./"$c.bin" >/dev/null 2>&1 || rc=$?
+            echo " clang=ok exit=$rc expect=${EXPECT[$c]}"
+            [ "$rc" = "${EXPECT[$c]}" ] || { echo "::error::$c wrong result"; exit 1; }
+          done
+
+      - name: Run front-end tests (lab0~lab3)
+        if: contains(fromJSON('["lab0","lab1","lab2","lab3"]'), github.ref_name)
+        run: |
+          set -uo pipefail
+          ANTLR="$JARS/antlr-$ANTLR_VERSION-complete.jar"
+          if [ "${{ github.ref_name }}" = "lab3" ]; then ARGS="8 4 d"; else ARGS=""; fi
+          failed=0
+          for f in tests/*.sysy; do
+            rc=0; out=$(java -cp "classes:$ANTLR" Main "$f" $ARGS 2>&1) || rc=$?
+            n=$(printf '%s\n' "$out" | grep -c . || true)
+            echo "$(basename "$f"): rc=$rc non_empty_lines=$n"
+            if [ "$n" -eq 0 ]; then echo "::warning::$(basename "$f") produced no output"; fi
+            if [ "${{ github.ref_name }}" != "lab3" ] && [ "$rc" -ne 0 ]; then failed=1; fi
+          done
+          exit $failed
+
+      - name: Upload generated IR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-ir-${{ github.ref_name }}
+          path: |
+            *.ll
+          if-no-files-found: ignore
